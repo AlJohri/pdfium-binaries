@@ -2,6 +2,7 @@
 
 IS_DEBUG=${PDFium_IS_DEBUG:-false}
 OS=${PDFium_TARGET_OS:?}
+TARGET_CPU=${PDFium_TARGET_CPU:?}
 TARGET_ENVIRONMENT=${PDFium_TARGET_ENVIRONMENT:-}
 VERSION=${PDFium_VERSION:-}
 PATCHES="$PWD/patches"
@@ -40,6 +41,54 @@ rm -f "$STAGING/include/DEPS"
 rm -f "$STAGING/include/README"
 rm -f "$STAGING/include/PRESUBMIT.py"
 
+# A static archive exposes every global symbol of PDFium's bundled
+# dependencies (abseil, ICU, libjpeg, freetype, ...), which can collide with
+# the consumer's own copies. Merge the archive into one relocatable object and
+# keep global only the public API.
+hide_internal_symbols() {
+  local lib="$1"
+  local tools="$SOURCE/third_party/llvm-build/Release+Asserts/bin"
+  local work="$BUILD/hide_internal_symbols"
+  rm -rf "$work"
+  mkdir -p "$work"
+
+  # One command per file, so a failing tool stops the step with its own error.
+  # Every function in PDFium's public headers is named FPDF*, FORM_* or FSDK_*.
+  "$tools/llvm-nm" --defined-only --extern-only --format=just-symbols "$lib" >"$work/defined.txt"
+  grep -E '^(FPDF|FORM_|FSDK_)' "$work/defined.txt" | sort -u >"$work/public.txt"
+  if ! grep -qx FPDF_InitLibrary "$work/public.txt"; then
+    echo "ERROR: no public symbols found in $lib (FPDF_InitLibrary missing)" >&2
+    exit 1
+  fi
+
+  # One merged object defeats the consumer's per-member archive extraction,
+  # so drop here what no public function reaches.
+  sed 's/^/--undefined=/' "$work/public.txt" >"$work/roots.rsp"
+  "$tools/ld.lld" -r --gc-sections "@$work/roots.rsp" --whole-archive "$lib" -o "$work/pdfium.o"
+  "$tools/llvm-objcopy" --keep-global-symbols="$work/public.txt" "$work/pdfium.o"
+
+  "$tools/llvm-nm" --defined-only --extern-only --format=just-symbols "$work/pdfium.o" >"$work/exported_unsorted.txt"
+  sort -u "$work/exported_unsorted.txt" >"$work/exported.txt"
+  if ! diff -u "$work/public.txt" "$work/exported.txt" >&2; then
+    echo "ERROR: the globals of the merged $lib differ from the public API" >&2
+    exit 1
+  fi
+  "$tools/llvm-readelf" --section-headers "$work/pdfium.o" >"$work/sections.txt"
+  if grep -q '\.crel\.' "$work/sections.txt"; then
+    echo "ERROR: $lib contains CREL sections, which GNU ld cannot read" >&2
+    exit 1
+  fi
+  "$tools/llvm-nm" --undefined-only "$work/pdfium.o" >"$work/undefined.txt"
+  if grep -E '__arm_(get_current_vg|tpidr2_|sme_)' "$work/undefined.txt" >&2; then
+    echo "ERROR: $lib needs SME runtime helpers; check libyuv_use_sme in 05-configure.sh" >&2
+    exit 1
+  fi
+
+  rm "$lib"
+  "$tools/llvm-ar" rcs "$lib" "$work/pdfium.o"
+  rm -rf "$work"
+}
+
 case "$OS-$BUILD_TYPE" in
   android-shared|linux-shared)
     mv "$BUILD/libpdfium.so" "$STAGING_LIB"
@@ -47,6 +96,12 @@ case "$OS-$BUILD_TYPE" in
 
   android-static|linux-static|mac-static|ios-static)
     mv "$BUILD/obj/libpdfium.a" "$STAGING_LIB"
+    # MIPS GOT offsets are 16 bits per input object: GNU ld splits the GOT
+    # across archive members, but one merged object overflows it.
+    case "$OS-$TARGET_CPU" in
+      linux-mipsel|linux-mips64el) ;;
+      linux-*) hide_internal_symbols "$STAGING_LIB/libpdfium.a" ;;
+    esac
     ;;
 
   mac-shared|ios-shared)

@@ -89,4 +89,10 @@ case "$TARGET_CPU" in
     ;;
 esac
 
+# Last, and only where the CREL flag is still present: older branches predate
+# it, and the mips patch above already removes it.
+if [ "$BUILD_TYPE" == "static" ] && grep -q -- '-Wa,--crel' build/config/compiler/BUILD.gn; then
+  apply_patch "$PATCHES/static_build.patch" build
+fi
+
 popd

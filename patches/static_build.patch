@@ -1,0 +1,14 @@
+diff --git a/config/compiler/BUILD.gn b/config/compiler/BUILD.gn
+index c106acfca..6bcf9ff7e 100644
+--- a/config/compiler/BUILD.gn
++++ b/config/compiler/BUILD.gn
+@@ -675,7 +675,8 @@ config("compiler") {
+     # It also causes segfault on Linux s390x:
+     # https://github.com/llvm/llvm-project/issues/149511
+     if (is_linux && use_lld && current_cpu != "arm" && current_cpu != "s390x") {
+-      cflags += [ "-Wa,--crel,--allow-experimental-crel" ]
++      # pdfium-binaries: static archives are linked by the consumer, possibly
++      # with GNU ld, which cannot read CREL sections.
+     }
+   }
+ 
