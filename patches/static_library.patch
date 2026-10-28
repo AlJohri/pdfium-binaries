@@ -1,8 +1,8 @@
 diff --git a/public/fpdfview.h b/public/fpdfview.h
-index 4910eac..35c32a6 100644
+index fdf2ec4b0..618a6a938 100644
 --- a/public/fpdfview.h
 +++ b/public/fpdfview.h
-@@ -203,25 +203,7 @@ typedef int FPDF_ANNOT_APPEARANCEMODE;
+@@ -197,25 +197,13 @@ typedef int FPDF_ANNOT_APPEARANCEMODE;
  // Dictionary value types.
  typedef int FPDF_OBJECT_TYPE;
  
@@ -17,14 +17,18 @@ index 4910eac..35c32a6 100644
 -#endif  // defined(FPDF_IMPLEMENTATION)
 -#else
 -#if defined(FPDF_IMPLEMENTATION)
--#define FPDF_EXPORT __attribute__((visibility("default")))
--#else
--#define FPDF_EXPORT
++// Static library: no dllexport/dllimport on Windows. Elsewhere the API is
++// marked default visibility, since the rest of the library is built hidden.
++#if !defined(WIN32) && defined(FPDF_IMPLEMENTATION)
+ #define FPDF_EXPORT __attribute__((visibility("default")))
+ #else
+ #define FPDF_EXPORT
 -#endif  // defined(FPDF_IMPLEMENTATION)
 -#endif  // defined(WIN32)
 -#else
- #define FPDF_EXPORT
+-#define FPDF_EXPORT
 -#endif  // defined(COMPONENT_BUILD)
++#endif
  
  #if defined(WIN32) && defined(FPDFSDK_EXPORTS)
  #define FPDF_CALLCONV __stdcall
