@@ -38,8 +38,11 @@ mkdir -p "$BUILD"
     # std::__Cr::ios_base as soon as pdfium's FDF code is pulled in.
     echo "use_custom_libcxx = false"
 
-    if [ "$OS-$TARGET_CPU" == "linux-arm64" ]; then
-      echo "use_lld = false"
+    # libyuv's SME kernels call compiler-rt helpers (__arm_get_current_vg,
+    # __arm_tpidr2_save) that the shared library links in but a static archive
+    # leaves undefined for the consumer.
+    if [ "$TARGET_CPU" == "arm64" ] && { [ "$OS" == "linux" ] || [ "$OS" == "android" ]; }; then
+      echo "libyuv_use_sme = false"
     fi
   fi
 

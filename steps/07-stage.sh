@@ -2,6 +2,7 @@
 
 IS_DEBUG=${PDFium_IS_DEBUG:-false}
 OS=${PDFium_TARGET_OS:?}
+TARGET_CPU=${PDFium_TARGET_CPU:?}
 TARGET_ENVIRONMENT=${PDFium_TARGET_ENVIRONMENT:-}
 VERSION=${PDFium_VERSION:-}
 PATCHES="$PWD/patches"
@@ -40,6 +41,115 @@ rm -f "$STAGING/include/DEPS"
 rm -f "$STAGING/include/README"
 rm -f "$STAGING/include/PRESUBMIT.py"
 
+# A static archive exposes every global symbol of PDFium's bundled
+# dependencies (abseil, ICU, libjpeg, freetype, ...), which can collide with
+# the consumer's own copies. Merge the archive into one relocatable object and
+# keep global only the FPDF_EXPORT functions the public headers declare.
+hide_internal_symbols() {
+  local lib="$1"
+  local tools="$SOURCE/third_party/llvm-build/Release+Asserts/bin"
+  local work="$BUILD/hide_internal_symbols"
+  local prefix=""
+  case "$OS" in
+    mac|ios) prefix="_" ;;
+  esac
+  rm -rf "$work"
+  mkdir -p "$work"
+
+  # One command per file, so a failing tool stops the step with its own error.
+  python3 "$(dirname "${BASH_SOURCE[0]}")/public_symbols.py" "$STAGING/include" >"$work/declared.txt"
+  sed "s/^/$prefix/" "$work/declared.txt" >"$work/declared_symbols.txt"
+  "$tools/llvm-nm" --defined-only --extern-only --format=just-symbols "$lib" >"$work/defined.txt"
+  grep -x -F -f "$work/declared_symbols.txt" "$work/defined.txt" | sort -u >"$work/public.txt"
+  if ! grep -qx "${prefix}FPDF_InitLibrary" "$work/public.txt"; then
+    echo "ERROR: no public symbols found in $lib (FPDF_InitLibrary missing)" >&2
+    exit 1
+  fi
+
+  case "$OS" in
+    linux|android)
+      # One merged object defeats the consumer's per-member archive
+      # extraction, so drop here what no public function reaches.
+      sed 's/^/--undefined=/' "$work/public.txt" >"$work/roots.rsp"
+      "$tools/ld.lld" -r --gc-sections "@$work/roots.rsp" --whole-archive "$lib" -o "$work/pdfium.o"
+      "$tools/llvm-objcopy" --keep-global-symbols="$work/public.txt" "$work/pdfium.o"
+      "$tools/llvm-nm" --defined-only --extern-only --format=just-symbols "$work/pdfium.o" \
+        >"$work/exported_unsorted.txt"
+      "$tools/llvm-readelf" --section-headers "$work/pdfium.o" >"$work/sections.txt"
+      if grep -q '\.crel\.' "$work/sections.txt"; then
+        echo "ERROR: $lib contains CREL sections, which GNU ld cannot read" >&2
+        exit 1
+      fi
+      ;;
+    mac|ios)
+      local arch
+      case "$TARGET_CPU" in
+        arm64) arch=arm64 ;;
+        x64) arch=x86_64 ;;
+        *)
+          echo "ERROR: unsupported CPU '$TARGET_CPU' for $OS" >&2
+          exit 1
+          ;;
+      esac
+      # ld -r requires -platform_version, so read the platform, deployment
+      # target and SDK from the first member that records them.
+      xcrun --find vtool >/dev/null
+      "$tools/llvm-ar" t "$lib" >"$work/members.txt"
+      local member platform="" minos="" sdk=""
+      while read -r member; do
+        "$tools/llvm-ar" x --output "$work" "$lib" "$member"
+        xcrun vtool -show-build "$work/$member" >"$work/build_version.txt" 2>/dev/null || true
+        rm -f "$work/$member"
+        read -r platform minos sdk < <(awk '$1 == "platform" { p = $2 } $1 == "minos" { m = $2 }
+          $1 == "sdk" { s = $2 } END { print p, m, s }' "$work/build_version.txt")
+        [ -n "$minos" ] && break
+      done <"$work/members.txt"
+      if [ -z "$minos" ]; then
+        echo "ERROR: no member of $lib records LC_BUILD_VERSION" >&2
+        exit 1
+      fi
+      case "$platform" in
+        MACOS) platform=macos ;;
+        IOS) platform=ios ;;
+        IOSSIMULATOR) platform=ios-simulator ;;
+        MACCATALYST) platform=mac-catalyst ;;
+        *)
+          echo "ERROR: unknown platform '$platform' in $lib" >&2
+          exit 1
+          ;;
+      esac
+      # vtool prints n/a for an object that records no SDK version.
+      [ "$sdk" == "n/a" ] && sdk="$minos"
+      # Apple ld rejects -dead_strip with -r. The merged object keeps
+      # MH_SUBSECTIONS_VIA_SYMBOLS, so the consumer's -dead_strip still applies.
+      xcrun ld -r -arch "$arch" -platform_version "$platform" "$minos" "$sdk" \
+        -all_load "$lib" -exported_symbols_list "$work/public.txt" -o "$work/pdfium.o"
+      "$tools/llvm-nm" --defined-only --extern-only -m "$work/pdfium.o" >"$work/exported_m.txt"
+      grep -v 'private external' "$work/exported_m.txt" | awk '{ print $NF }' \
+        >"$work/exported_unsorted.txt"
+      ;;
+    *)
+      echo "ERROR: hide_internal_symbols does not support $OS" >&2
+      exit 1
+      ;;
+  esac
+
+  sort -u "$work/exported_unsorted.txt" >"$work/exported.txt"
+  if ! diff -u "$work/public.txt" "$work/exported.txt" >&2; then
+    echo "ERROR: the globals of the merged $lib differ from the public API" >&2
+    exit 1
+  fi
+  "$tools/llvm-nm" --undefined-only "$work/pdfium.o" >"$work/undefined.txt"
+  if grep -E '__arm_(get_current_vg|tpidr2_|sme_)' "$work/undefined.txt" >&2; then
+    echo "ERROR: $lib needs SME runtime helpers; check libyuv_use_sme in 05-configure.sh" >&2
+    exit 1
+  fi
+
+  rm "$lib"
+  "$tools/llvm-ar" rcs "$lib" "$work/pdfium.o"
+  rm -rf "$work"
+}
+
 case "$OS-$BUILD_TYPE" in
   android-shared|linux-shared)
     mv "$BUILD/libpdfium.so" "$STAGING_LIB"
@@ -47,6 +157,12 @@ case "$OS-$BUILD_TYPE" in
 
   android-static|linux-static|mac-static|ios-static)
     mv "$BUILD/obj/libpdfium.a" "$STAGING_LIB"
+    # MIPS GOT offsets are 16 bits per input object: GNU ld splits the GOT
+    # across archive members, but one merged object overflows it.
+    case "$TARGET_CPU" in
+      mipsel|mips64el) ;;
+      *) hide_internal_symbols "$STAGING_LIB/libpdfium.a" ;;
+    esac
     ;;
 
   mac-shared|ios-shared)
@@ -68,8 +184,13 @@ case "$OS-$BUILD_TYPE" in
     [ "$IS_DEBUG" == "true" ] && mv "$BUILD/pdfium.dll.pdb" "$STAGING_BIN"
     ;;
 
-  win-shared)
+  win-static)
     mv "$BUILD/obj/pdfium.lib" "$STAGING_LIB"
+    ;;
+
+  *)
+    echo "ERROR: no staging rule for $OS-$BUILD_TYPE" >&2
+    exit 1
     ;;
 esac
 
